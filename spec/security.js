@@ -47,10 +47,15 @@ describe('security issues', function() {
 
             });
 
-            shouldCompileTo('{{#with this as |obj|}}{{obj.abc}}{{/with}}',
-                new TestClass(), 'xyz');
-            shouldCompileTo('{{#with this as |obj|}}{{lookup obj "abc"}}{{/with}}',
-                new TestClass(), 'xyz');
+            // Prototype properties are denied unless the runtime options allow them.
+            expectTemplate('{{#with this as |obj|}}{{obj.abc}}{{/with}}')
+                .withInput(new TestClass())
+                .withRuntimeOptions({allowedProtoProperties: {abc: true}})
+                .toCompileTo('xyz');
+            expectTemplate('{{#with this as |obj|}}{{lookup obj "abc"}}{{/with}}')
+                .withInput(new TestClass())
+                .withRuntimeOptions({allowedProtoProperties: {abc: true}})
+                .toCompileTo('xyz');
 
         });
     });
@@ -894,5 +899,115 @@ describe('security issues', function() {
         var loc = code.match(/"loc":(\{.*?\}\})/);
         expect(JSON.parse(loc[1]).source).to.equal(srcName);
       });
+    });
+
+    describe('sonatype-2020-0293: access control to prototype properties', function() {
+        // Handlebars 4.6.0 (PR #1633) denies members that are not "own
+        // properties" of their parent unless the runtime options allow them.
+        function Person() {
+            this.own = 'own value';
+            this.ownFn = function() { return 'own method'; };
+        }
+        Object.defineProperty(Person.prototype, 'name', {
+            get: function() { return 'Ada'; }
+        });
+        Person.prototype.greet = function() { return 'hello'; };
+
+        it('should deny inherited properties and methods by default', function() {
+            expectTemplate('[{{p.name}}][{{p.greet}}]').withInput({p: new Person()}).toCompileTo('[][]');
+            expectTemplate('[{{o.inherited}}]').withInput({o: Object.create({inherited: 'x'})}).toCompileTo('[]');
+        });
+
+        it('should deny members of built-in prototypes (issue #1628)', function() {
+            expectTemplate('{{aString.trim}}').withInput({aString: '  abc  '}).toCompileTo('');
+            expectTemplate('{{#url}}{{small}}{{/url}}').withInput({url: 'http://example.com'}).toCompileTo('');
+        });
+
+        it('should keep resolving own properties and own methods', function() {
+            expectTemplate('[{{p.own}}][{{p.ownFn}}]').withInput({p: new Person()}).toCompileTo('[own value][own method]');
+            expectTemplate('[{{aString.length}}]').withInput({aString: 'abc'}).toCompileTo('[3]');
+        });
+
+        it('should allow single properties and methods with allowedProtoProperties and allowedProtoMethods', function() {
+            expectTemplate('[{{p.name}}][{{p.greet}}]')
+                .withInput({p: new Person()})
+                .withRuntimeOptions({allowedProtoProperties: {name: true}})
+                .toCompileTo('[Ada][]');
+            expectTemplate('[{{p.name}}][{{p.greet}}]')
+                .withInput({p: new Person()})
+                .withRuntimeOptions({allowedProtoMethods: {greet: true}})
+                .toCompileTo('[][hello]');
+        });
+
+        it('should allow all properties or methods with allowProtoPropertiesByDefault and allowProtoMethodsByDefault', function() {
+            expectTemplate('[{{p.name}}][{{p.greet}}]')
+                .withInput({p: new Person()})
+                .withRuntimeOptions({allowProtoPropertiesByDefault: true})
+                .toCompileTo('[Ada][]');
+            expectTemplate('[{{p.name}}][{{p.greet}}]')
+                .withInput({p: new Person()})
+                .withRuntimeOptions({allowProtoMethodsByDefault: true})
+                .toCompileTo('[][hello]');
+            expectTemplate('[{{p.name}}]')
+                .withInput({p: new Person()})
+                .withRuntimeOptions({allowProtoPropertiesByDefault: true, allowedProtoProperties: {name: false}})
+                .toCompileTo('[]');
+        });
+
+        it('should apply to the lookup helper', function() {
+            expectTemplate('[{{lookup p "name"}}]').withInput({p: new Person()}).toCompileTo('[]');
+            expectTemplate('[{{lookup p "name"}}]')
+                .withInput({p: new Person()})
+                .withRuntimeOptions({allowedProtoProperties: {name: true}})
+                .toCompileTo('[Ada]');
+        });
+
+        it('should apply to depth lookups in compat mode', function() {
+            expectTemplate('{{#with child}}[{{name}}]{{/with}}')
+                .withInput({child: {}, __proto__: {name: 'inherited'}})
+                .withCompileOptions({compat: true})
+                .toCompileTo('[]');
+            expectTemplate('{{#with child}}[{{name}}]{{/with}}')
+                .withInput({child: {}, name: 'own'})
+                .withCompileOptions({compat: true})
+                .toCompileTo('[own]');
+        });
+
+        it('should apply inside partials and pass the runtime options on', function() {
+            expectTemplate('{{> part p}}')
+                .withInput({p: new Person()})
+                .withPartial('part', '[{{name}}]')
+                .toCompileTo('[]');
+            expectTemplate('{{> part p}}')
+                .withInput({p: new Person()})
+                .withPartial('part', '[{{name}}]')
+                .withRuntimeOptions({allowedProtoProperties: {name: true}})
+                .toCompileTo('[Ada]');
+        });
+
+        it('should pass lookupProperty to helpers', function() {
+            expectTemplate('{{h p}}')
+                .withInput({p: new Person()})
+                .withHelper('h', function(p, options) {
+                    return options.lookupProperty(p, 'own') + '/' + options.lookupProperty(p, 'name');
+                })
+                .toCompileTo('own value/undefined');
+        });
+
+        it('should keep the deny list for dangerous names, whatever the runtime options say', function() {
+            var options = {allowedProtoMethods: {constructor: true}, allowProtoMethodsByDefault: true, allowProtoPropertiesByDefault: true};
+            expectTemplate('[{{fn.constructor.name}}][{{lookup fn "constructor"}}][{{fn.__proto__.constructor.name}}]')
+                .withInput({fn: function() {}})
+                .withRuntimeOptions(options)
+                .toCompileTo('[][][]');
+        });
+
+        it('should emit a lookupProperty that falls back to own properties on a runtime without one', function() {
+            if (!Handlebars.precompile) {
+                return;
+            }
+            var code = Handlebars.precompile('{{a.b}}');
+            expect(code).to.contain('container.lookupProperty ||');
+        });
     });
 });
